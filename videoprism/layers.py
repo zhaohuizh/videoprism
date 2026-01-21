@@ -16,6 +16,7 @@
 
 from collections.abc import Callable
 import functools
+import os
 import string
 from typing import Any
 from flax import linen as nn
@@ -29,6 +30,151 @@ Initializer = nn.initializers.Initializer
 
 default_kernel_init = nn.initializers.lecun_normal()
 gelu = functools.partial(jax.nn.gelu, approximate=False)
+
+# -----------------------------------------------------------------------------
+# Optional quantized matmul backend (e.g., NVFP4 via jax.nn.scaled_dot_general).
+#
+# This is guarded by env vars so default behavior is unchanged:
+# - AVA_VIDEO_MATMUL_MODE / VIDEOPRISM_MATMUL_MODE: "nvfp4" or "mxfp8"
+# - AVA_VIDEO_MATMUL_GLOBAL_SCALE / VIDEOPRISM_MATMUL_GLOBAL_SCALE: float (nvfp4 only)
+# -----------------------------------------------------------------------------
+
+_MATMUL_MODE = (
+    os.getenv('AVA_VIDEO_MATMUL_MODE')
+    or os.getenv('VIDEOPRISM_MATMUL_MODE')
+    or ''
+).strip().lower()
+
+_FUSED_ATTENTION = (
+    os.getenv('AVA_VIDEO_FUSED_ATTENTION')
+    or os.getenv('VIDEOPRISM_FUSED_ATTENTION')
+    or ''
+).strip().lower() in ('1', 'true', 'yes')
+
+# VideoPrism applies a "logit cap" (tanh) in attention when atten_logit_cap > 0.
+# cuDNN fused attention (jax.nn.dot_product_attention impl='cudnn') cannot
+# represent that transformation. This flag allows using fused attention anyway by
+# *skipping* the cap (behavioral change).
+_FUSED_ATTENTION_IGNORE_LOGIT_CAP = (
+    os.getenv('AVA_VIDEO_FUSED_ATTENTION_IGNORE_LOGIT_CAP')
+    or os.getenv('VIDEOPRISM_FUSED_ATTENTION_IGNORE_LOGIT_CAP')
+    or ''
+).strip().lower() in ('1', 'true', 'yes')
+
+_SDG_CONFIGS = None
+if _MATMUL_MODE in ('nvfp4', 'mxfp8'):
+  try:
+    if _MATMUL_MODE == 'nvfp4':
+      global_scale_env = (
+          os.getenv('AVA_VIDEO_MATMUL_GLOBAL_SCALE')
+          or os.getenv('VIDEOPRISM_MATMUL_GLOBAL_SCALE')
+          or '1.0'
+      )
+      global_scale = float(global_scale_env)
+      global_scale_arr = jnp.array([global_scale], dtype=jnp.float32)
+      cfg = jax.nn.get_scaled_dot_general_config('nvfp4', global_scale_arr)
+    else:
+      cfg = jax.nn.get_scaled_dot_general_config('mxfp8')
+    _SDG_CONFIGS = [cfg] * 3
+  except Exception:
+    # If configs fail to initialize, silently fall back to regular matmul.
+    _SDG_CONFIGS = None
+
+
+def _prefer_sdg_output_dtype(fprop_dtype: jnp.dtype) -> jnp.dtype:
+  """Returns an output dtype supported by scaled_dot_general."""
+  if fprop_dtype in (jnp.float16, jnp.bfloat16, jnp.float32):
+    return fprop_dtype
+  # float8/fp4 outputs are not supported as preferred_element_type here.
+  return jnp.float16
+
+
+def _matmul_dot_general(
+    lhs: Array,
+    rhs: Array,
+    dimension_numbers: Any,
+    preferred_element_type: jnp.dtype,
+) -> Array:
+  """Matmul helper that uses scaled_dot_general when enabled."""
+  if _SDG_CONFIGS is None:
+    return jax.lax.dot_general(
+        lhs,
+        rhs,
+        dimension_numbers,
+        preferred_element_type=preferred_element_type,
+    )
+
+  # NVFP4 (and MXFP8) quantize along the contracting dimension in blocks. If the
+  # effective contracting dimension (after any reshape/flatten done by the op)
+  # is not a multiple of block_size, cuDNN will assert.
+  #
+  # Additionally, some kernels are not available for certain effective (M, N, K)
+  # shapes. We conservatively fall back unless M/N/K are multiples of block_size.
+  try:
+    (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dimension_numbers
+    block_size = getattr(_SDG_CONFIGS[0], 'block_size', None)
+    if block_size is not None:
+      block_size = int(block_size)
+      mode = getattr(_SDG_CONFIGS[0], 'mode', '')
+      # Empirically on current cuDNN NVFP4, some shapes require K to be a
+      # multiple of 32 (even though block_size is 16); otherwise we see
+      # "No valid engine configs for Matmul_".
+      k_multiple = block_size * 2 if mode == 'nvfp4' else block_size
+
+      contract_dim = 1
+      for d in lhs_contract:
+        contract_dim *= int(lhs.shape[d])
+      if contract_dim < k_multiple or contract_dim % k_multiple != 0:
+        return jax.lax.dot_general(
+            lhs,
+            rhs,
+            dimension_numbers,
+            preferred_element_type=preferred_element_type,
+        )
+
+      lhs_contract_set = set(lhs_contract)
+      lhs_batch_set = set(lhs_batch)
+      m_dim = 1
+      for i in range(lhs.ndim):
+        if i in lhs_contract_set or i in lhs_batch_set:
+          continue
+        m_dim *= int(lhs.shape[i])
+
+      rhs_contract_set = set(rhs_contract)
+      rhs_batch_set = set(rhs_batch)
+      n_dim = 1
+      for i in range(rhs.ndim):
+        if i in rhs_contract_set or i in rhs_batch_set:
+          continue
+        n_dim *= int(rhs.shape[i])
+
+      if (
+          m_dim < block_size
+          or m_dim % block_size != 0
+          or n_dim < block_size
+          or n_dim % block_size != 0
+      ):
+        return jax.lax.dot_general(
+            lhs,
+            rhs,
+            dimension_numbers,
+            preferred_element_type=preferred_element_type,
+        )
+  except Exception:
+    # If we fail to reason about shapes, fall back to the safe path.
+    return jax.lax.dot_general(
+        lhs,
+        rhs,
+        dimension_numbers,
+        preferred_element_type=preferred_element_type,
+    )
+  return jax.nn.scaled_dot_general(
+      lhs,
+      rhs,
+      dimension_numbers,
+      preferred_element_type=preferred_element_type,
+      configs=_SDG_CONFIGS,
+  )
 
 
 def identity(x: Array) -> Array:
@@ -84,7 +230,9 @@ def _convert_paddings_to_mask(
   Returns:
     A jax.Array of shape [B, 1, 1, T] ready to be added to attention logits.
   """
-  attention_mask = paddings[:, jnp.newaxis, jnp.newaxis, :]
+  # Important for fp8: avoid implicit dtype promotion (float8 <-> float32).
+  # Always cast paddings to the requested mask dtype before scaling.
+  attention_mask = paddings.astype(dtype)[:, jnp.newaxis, jnp.newaxis, :]
   attention_mask *= _get_large_negative_number(dtype)
   return attention_mask
 
@@ -169,11 +317,13 @@ def compute_attention_masks_for_fprop(
       self-attention of shape [1|B, 1, 1|T, T].
   """
   # Get paddings mask to [B, 1, 1, T].
-  attention_mask = _convert_paddings_to_mask(paddings, inputs.dtype)
+  # Mask is applied to fp32 logits, so keep mask in fp32 regardless of fprop dtype.
+  attention_mask = _convert_paddings_to_mask(paddings, jnp.float32)
 
   # Causal mask of shape [1, 1, T, T].
   if causal_attention:
-    causal_mask = _causal_mask(inputs)
+    # Ensure causal mask is also fp32 to avoid float8/float32 promotion errors.
+    causal_mask = _causal_mask(inputs.astype(jnp.float32))
     attention_mask = _merge_masks(attention_mask, causal_mask)
 
   return attention_mask
@@ -290,6 +440,22 @@ class FeedForward(Module):
   @nn.compact
   def __call__(self, inputs: Array) -> Array:
 
+    # If enabled, use scaled_dot_general (e.g., NVFP4) for the Dense matmul.
+    # We keep the submodule name/params ("linear/kernel", "linear/bias") to stay
+    # compatible with pretrained checkpoints.
+    if _SDG_CONFIGS is not None:
+      output_dim = self.output_dim if self.output_dim > 0 else inputs.shape[-1]
+      projected_inputs = ScaledDotDense(
+          features=output_dim,
+          use_bias=self.has_bias,
+          kernel_init=self.weight_init,
+          bias_init=self.bias_init,
+          name='linear',
+          dtype=self.dtype,
+          fprop_dtype=self.fprop_dtype,
+      )(inputs)
+      return self.activation_fn(projected_inputs)
+
     def _promote_dtype(x, kernel, bias, dtype):
       """Promotes the dtype of the arrays to the desired dtype."""
       del dtype
@@ -311,6 +477,57 @@ class FeedForward(Module):
         promote_dtype=_promote_dtype,
     )(inputs)
     return self.activation_fn(projected_inputs)
+
+
+class ScaledDotDense(Module):
+  """Dense layer that optionally uses scaled_dot_general (NVFP4/MXFP8).
+
+  This matches the parameter naming of flax.linen.Dense (kernel/bias) so we can
+  load pretrained checkpoints without changes.
+  """
+
+  # Must have a default because `Module` base class defines default fields.
+  features: int = 0
+  use_bias: bool = True
+  kernel_init: Initializer = default_kernel_init
+  bias_init: Initializer = nn.initializers.zeros_init()
+
+  @nn.compact
+  def __call__(self, inputs: Array) -> Array:
+    in_features = inputs.shape[-1]
+    kernel = self._cast_to_fprop_dtype(
+        self.param('kernel', self.kernel_init, (in_features, self.features), self.dtype)
+    )
+    dn = (((inputs.ndim - 1,), (0,)), ((), ()))
+    out_dtype = _prefer_sdg_output_dtype(self.fprop_dtype)
+
+    # If we're using block-scaled quantized matmul (NVFP4/MXFP8), ensure the
+    # contracting dimension is compatible with the backend block size.
+    #
+    # VideoPrism patch projection has K = P^2 * C = 18*18*3 = 972 which is not
+    # divisible by 16, so NVFP4 would otherwise fall back or assert. Padding with
+    # zeros preserves the unquantized matmul result and enables the fast path.
+    if _SDG_CONFIGS is not None:
+      block_size = getattr(_SDG_CONFIGS[0], 'block_size', None)
+      if block_size is not None:
+        block_size = int(block_size)
+        mode = getattr(_SDG_CONFIGS[0], 'mode', '')
+        # See `_matmul_dot_general`: NVFP4 often requires K multiple-of-32.
+        k_multiple = block_size * 2 if mode == 'nvfp4' else block_size
+        k = int(in_features)
+        pad_k = (-k) % k_multiple
+        if pad_k:
+          pad_width_inputs = [(0, 0)] * (inputs.ndim - 1) + [(0, pad_k)]
+          inputs = jnp.pad(inputs, pad_width_inputs)
+          kernel = jnp.pad(kernel, [(0, pad_k), (0, 0)])
+
+    y = _matmul_dot_general(inputs, kernel, dn, preferred_element_type=out_dtype)
+    if self.use_bias:
+      bias = self._cast_to_fprop_dtype(
+          self.param('bias', self.bias_init, (self.features,), self.dtype)
+      )
+      y = y + bias
+    return y
 
 
 class TransformerFeedForward(Module):
@@ -485,7 +702,15 @@ class AttentionProjection(Module):
       batch_eqn = eqn_sym[: (rank - 1)] if rank else '...'
       eqn = f'{batch_eqn}D,DNH->{batch_eqn}NH'
 
-    ret = jnp.einsum(eqn, inputs, w)
+    if _SDG_CONFIGS is None:
+      ret = jnp.einsum(eqn, inputs, w)
+    else:
+      out_dtype = _prefer_sdg_output_dtype(self.fprop_dtype)
+      if self.is_output_projection:
+        dn = (((rank - 2, rank - 1), (1, 2)), ((), ()))
+      else:
+        dn = (((rank - 1,), (0,)), ((), ()))
+      ret = _matmul_dot_general(inputs, w, dn, preferred_element_type=out_dtype)
     if self.use_bias:
       b = self._cast_to_fprop_dtype(
           self.param(
@@ -641,8 +866,47 @@ class DotProductAttention(Module):
     assert atten_mask.shape[0] in [key.shape[0], 1]
 
     query = self._scale_query(query)
-    logits = self._atten_logits(query, key)
 
+    # Optional: use cuDNN fused attention (FlashAttention-like) for inference.
+    # This reduces memory traffic and can significantly improve throughput.
+    if _FUSED_ATTENTION and not train:
+      # cuDNN fused attention only supports fp16/bf16/fp8 inputs.
+      if query.dtype not in (
+          jnp.float16,
+          jnp.bfloat16,
+          jnp.float8_e4m3fn,
+          jnp.float8_e5m2,
+      ):
+        pass
+      if self.atten_logit_cap and self.atten_logit_cap > 0.0 and not _FUSED_ATTENTION_IGNORE_LOGIT_CAP:
+        # Fall back to the reference path to preserve exact behavior.
+        pass
+      else:
+        # Match reference behavior: query scaling already applied; only apply the
+        # optional extra scaling if enabled.
+        scale = 1.0 / np.sqrt(key.shape[-1]) if self.scale_logits_by_head_dims else 1.0
+        # Keep bias in fp32 since attention logits are computed/applied in fp32.
+        bias = atten_mask.astype(jnp.float32)
+        # cuDNN fused attention is stricter than general broadcasting: it requires
+        # the bias tensor to have explicit query length (T) and key length (S)
+        # dimensions. VideoPrism often uses a padding-only bias of shape
+        # [B, 1, 1, S]. Expand it to [B, 1, T, S] for fused attention.
+        t = query.shape[-3]
+        if bias.ndim == 4 and bias.shape[-2] == 1 and t != 1:
+          bias = jnp.broadcast_to(bias, (bias.shape[0], bias.shape[1], t, bias.shape[-1]))
+        encoded = jax.nn.dot_product_attention(
+            query,
+            key,
+            value,
+            bias=bias,
+            scale=scale,
+            implementation='cudnn',
+        )
+        # Attention probabilities are not used by VideoPrism inference codepaths.
+        dummy_probs = jnp.zeros((0,), dtype=self.fprop_dtype)
+        return encoded, dummy_probs
+
+    logits = self._atten_logits(query, key)
     if self.scale_logits_by_head_dims:
       logits = jnp.multiply(logits, 1.0 / np.sqrt(key.shape[-1]))
 
@@ -1103,7 +1367,8 @@ class AttenTokenPoolingLayer(Module):
     if paddings is None:
       paddings = jnp.zeros([batch_size, seq_length], dtype=tokens.dtype)
 
-    atten_mask = _convert_paddings_to_mask(paddings, dtype=paddings.dtype)
+    # Keep mask in fp32 since attention logits are computed/applied in fp32.
+    atten_mask = _convert_paddings_to_mask(paddings, dtype=jnp.float32)
     outputs, _ = DotProductAttention(
         name='pooling_attention',
         hidden_dim=hidden_dim,
